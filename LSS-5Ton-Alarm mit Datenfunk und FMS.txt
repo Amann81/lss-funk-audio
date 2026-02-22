@@ -1,0 +1,866 @@
+// ==UserScript==
+// @name         LSS Funk BOS Universal FINAL (DE) - Original Audio + Queue + Squelch + Testpanel (Fix Status3)
+// @namespace    https://www.leitstellenspiel.de/
+// @version      10.7
+// @description  FIX: Alarm NUR bei echter Statusnummer 3 (aus Zeile extrahiert). Status 1/2/3/4/7/8 -> FMS. Status 3: 1x Datenfunk + Alarm je Org (FW/RD/THW) + Sammelansage. RD+POL: Transport-Durchsage mit Ziel. Extras: Queue (keine Overlaps), Squelch/Träger, Master-Kompressor, Testpanel, Debug.
+// @match        https://www.leitstellenspiel.de/*
+// @match        https://www.missionchief.com/*
+// @match        https://www.meldkamerspel.com/*
+// @grant        GM_getResourceURL
+// @resource     SND_FW      https://raw.githubusercontent.com/Amann81/lss-funk-audio/main/5ton_1.mp3
+// @resource     SND_RD      https://raw.githubusercontent.com/Amann81/lss-funk-audio/main/5ton_2.mp3
+// @resource     SND_DATA    https://raw.githubusercontent.com/Amann81/lss-funk-audio/main/5ton_3.mp3
+// @resource     SND_FMS     https://raw.githubusercontent.com/Amann81/lss-funk-audio/main/5ton_4.mp3
+// @resource     SND_THW     https://raw.githubusercontent.com/Amann81/lss-funk-audio/main/5ton_5.mp3
+// ==/UserScript==
+
+(function () {
+  "use strict";
+
+  /* =========================
+     SETTINGS
+  ========================= */
+
+  // Lautstärke der Originaldateien
+  var volFMS   = 1.00;
+  var volData  = 1.00;
+  var volFW    = 1.00;
+  var volRD    = 1.00;
+  var volTHW   = 1.00;
+
+  // Master Lautstärke (Gesamt)
+  var masterVolume = 1.00;
+
+  // Squelch/Träger (Funk-Rauschen)
+  var ENABLE_SQUELCH = true;
+  var squelchPreMs   = 65;
+  var squelchPostMs  = 95;
+  var squelchLevel   = 0.07;
+  var squelchBandHz  = 1700;
+  var squelchBandQ   = 0.9;
+
+  // Audio Queue: Abstand nach jedem Clip
+  var GAP_AFTER_AUDIO_MS = 40;
+
+  // RD/POL optional: kurzer Datenfunk bevor Durchsage
+  var DATA_BEFORE_RD_POL_SPEECH = false;
+  var DATA_BEFORE_RD_POL_DELAY_MS = 0;
+
+  // Sammel-Window: innerhalb dieser Zeit werden Status-3-Fahrzeuge zum selben Einsatz gesammelt
+  var COLLECT_WINDOW_MS = 900;
+
+  // Cooldown pro Einsatz (ms)
+  var MISSION_COOLDOWN_MS = 7000;
+
+  // Cooldown für Durchsagen pro Fahrzeug
+  var RD_SPEAK_COOLDOWN_MS  = 9000;
+  var POL_SPEAK_COOLDOWN_MS = 7000;
+
+  // Speech Rates
+  var language = "de-DE";
+  var rateFW = 0.95, rateRD = 1.00, ratePOL = 0.90, rateTHW = 0.95;
+
+  // Debug
+  var DEBUG = false;
+
+  /* =========================
+     STATE
+  ========================= */
+  var FUNK_ENABLED = false;
+
+  /* =========================
+     AUDIO INIT + MASTER CHAIN
+  ========================= */
+  var audioCtx = null;
+  var samples = {}; // name -> {buffer, loaded}
+
+  var masterIn = null;
+  var masterGain = null;
+  var masterComp = null;
+
+  function log() {
+    if (!DEBUG) return;
+    try { console.log.apply(console, arguments); } catch (e) {}
+  }
+
+  function initAudio() {
+    try {
+      if (!audioCtx) {
+        var Ctx = window.AudioContext || window.webkitAudioContext;
+        if (!Ctx) return false;
+        audioCtx = new Ctx();
+      }
+      if (audioCtx.state === "suspended") audioCtx.resume().catch(function () {});
+
+      if (!masterIn) {
+        masterIn = audioCtx.createGain();
+
+        masterComp = audioCtx.createDynamicsCompressor();
+        try {
+          masterComp.threshold.value = -18;
+          masterComp.knee.value = 18;
+          masterComp.ratio.value = 5.5;
+          masterComp.attack.value = 0.003;
+          masterComp.release.value = 0.12;
+        } catch (e) {}
+
+        masterGain = audioCtx.createGain();
+        masterGain.gain.value = masterVolume;
+
+        masterIn.connect(masterComp);
+        masterComp.connect(masterGain);
+        masterGain.connect(audioCtx.destination);
+      } else {
+        masterGain.gain.value = masterVolume;
+      }
+
+      return true;
+    } catch (e) {
+      console.warn("initAudio error:", e);
+      return false;
+    }
+  }
+
+  function loadSample(name, resourceKey) {
+    try {
+      if (!audioCtx) return Promise.reject("No audioCtx");
+      var url = GM_getResourceURL(resourceKey);
+
+      return fetch(url)
+        .then(function (r) { return r.arrayBuffer(); })
+        .then(function (ab) {
+          return new Promise(function (resolve, reject) {
+            audioCtx.decodeAudioData(ab, function (buf) {
+              samples[name] = { buffer: buf, loaded: true };
+              resolve(true);
+            }, function (err) { reject(err); });
+          });
+        })
+        .catch(function (e) {
+          console.warn("Sample load failed:", name, e);
+          samples[name] = { buffer: null, loaded: false };
+          return false;
+        });
+    } catch (e) {
+      console.warn("loadSample error:", name, e);
+      samples[name] = { buffer: null, loaded: false };
+      return Promise.resolve(false);
+    }
+  }
+
+  function playSample(name, whenSec, volume) {
+    if (!audioCtx || !masterIn) return 0;
+    var s = samples[name];
+    if (!s || !s.loaded || !s.buffer) return 0;
+
+    var t0 = audioCtx.currentTime + (whenSec || 0);
+
+    var src = audioCtx.createBufferSource();
+    src.buffer = s.buffer;
+
+    var g = audioCtx.createGain();
+    g.gain.value = (typeof volume === "number") ? volume : 1.0;
+
+    src.connect(g);
+    g.connect(masterIn);
+
+    src.start(t0);
+    return s.buffer.duration;
+  }
+
+  /* =========================
+     SQUELCH / NOISE
+  ========================= */
+  function playSquelch(whenSec, durMs, level) {
+    if (!ENABLE_SQUELCH) return 0;
+    if (!audioCtx || !masterIn) return 0;
+
+    var durSec = Math.max(0.02, (durMs || 60) / 1000);
+    var startTime = audioCtx.currentTime + (whenSec || 0);
+
+    var sr = audioCtx.sampleRate;
+    var len = Math.max(1, Math.floor(sr * durSec));
+    var buf = audioCtx.createBuffer(1, len, sr);
+    var data = buf.getChannelData(0);
+    for (var i = 0; i < len; i++) data[i] = (Math.random() * 2 - 1);
+
+    var src = audioCtx.createBufferSource();
+    src.buffer = buf;
+
+    var band = audioCtx.createBiquadFilter();
+    band.type = "bandpass";
+    band.frequency.value = squelchBandHz;
+    band.Q.value = squelchBandQ;
+
+    var lp = audioCtx.createBiquadFilter();
+    lp.type = "lowpass";
+    lp.frequency.value = 2900;
+
+    var g = audioCtx.createGain();
+    var lvl = (typeof level === "number") ? level : squelchLevel;
+
+    g.gain.setValueAtTime(0.0001, startTime);
+    g.gain.exponentialRampToValueAtTime(Math.max(0.0002, lvl), startTime + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, startTime + durSec);
+
+    src.connect(band);
+    band.connect(lp);
+    lp.connect(g);
+    g.connect(masterIn);
+
+    src.start(startTime);
+    src.stop(startTime + durSec + 0.02);
+
+    return durSec;
+  }
+
+  /* =========================
+     AUDIO QUEUE (no overlaps)
+  ========================= */
+  var q = [];
+  var qRunning = false;
+
+  function sleep(ms) {
+    return new Promise(function (res) { setTimeout(res, ms); });
+  }
+
+  function enqueue(jobName, fn) {
+    q.push({ name: jobName || "job", fn: fn });
+    if (!qRunning) runQueue();
+  }
+
+  async function runQueue() {
+    qRunning = true;
+    while (q.length) {
+      var item = q.shift();
+      try {
+        log("[QUEUE] start:", item.name, "len=", q.length);
+        await item.fn();
+      } catch (e) {
+        console.warn("[QUEUE] error in", item.name, e);
+      }
+    }
+    qRunning = false;
+  }
+
+  /* =========================
+     SPEECH (queued)
+  ========================= */
+  function speakQueued(text, org) {
+    return new Promise(function (resolve) {
+      try {
+        var msg = new SpeechSynthesisUtterance(text);
+        msg.lang = language;
+        msg.rate =
+          (org === "POL") ? ratePOL :
+          (org === "RD") ? rateRD :
+          (org === "THW") ? rateTHW :
+          rateFW;
+
+        msg.onend = function () { resolve(true); };
+        msg.onerror = function () { resolve(false); };
+        speechSynthesis.speak(msg);
+      } catch (e) {
+        resolve(false);
+      }
+    });
+  }
+
+  /* =========================
+     UI BUTTON + TESTPANEL
+  ========================= */
+  function makeBtn(text, bottomPx, onClick) {
+    var b = document.createElement("button");
+    b.innerText = text;
+    b.style.position = "fixed";
+    b.style.bottom = bottomPx + "px";
+    b.style.right = "20px";
+    b.style.zIndex = "99999";
+    b.style.padding = "10px";
+    b.style.fontSize = "14px";
+    b.style.borderRadius = "8px";
+    b.style.border = "1px solid #444";
+    b.style.background = "#111";
+    b.style.color = "#fff";
+    b.onclick = onClick;
+    document.body.appendChild(b);
+    return b;
+  }
+
+  function makePanel() {
+    var wrap = document.createElement("div");
+    wrap.style.position = "fixed";
+    wrap.style.right = "20px";
+    wrap.style.bottom = "70px";
+    wrap.style.zIndex = "99999";
+    wrap.style.display = "none";
+    wrap.style.padding = "10px";
+    wrap.style.background = "rgba(0,0,0,0.75)";
+    wrap.style.border = "1px solid #444";
+    wrap.style.borderRadius = "10px";
+    wrap.style.fontFamily = "system-ui, -apple-system, Segoe UI, Roboto, Arial";
+    wrap.style.fontSize = "12px";
+    wrap.style.color = "#fff";
+    wrap.style.maxWidth = "220px";
+
+    function rowBtn(label, fn) {
+      var b = document.createElement("button");
+      b.textContent = label;
+      b.style.display = "block";
+      b.style.width = "100%";
+      b.style.margin = "6px 0";
+      b.style.padding = "7px 8px";
+      b.style.borderRadius = "8px";
+      b.style.border = "1px solid #444";
+      b.style.background = "#121212";
+      b.style.color = "#fff";
+      b.style.cursor = "pointer";
+      b.onclick = fn;
+      wrap.appendChild(b);
+    }
+
+    var title = document.createElement("div");
+    title.textContent = "📻 Funk Testpanel";
+    title.style.fontWeight = "700";
+    title.style.marginBottom = "8px";
+    wrap.appendChild(title);
+
+    rowBtn("Test: FMS", function () {
+      if (!FUNK_ENABLED) return;
+      enqueue("TEST_FMS", async function () { await playFMSQueued(); });
+    });
+
+    rowBtn("Test: Datenfunk", function () {
+      if (!FUNK_ENABLED) return;
+      enqueue("TEST_DATA", async function () { await playDataQueued(); });
+    });
+
+    rowBtn("Test: Alarm FW", function () { testAlarmOrg("FW"); });
+    rowBtn("Test: Alarm RD", function () { testAlarmOrg("RD"); });
+    rowBtn("Test: Alarm THW", function () { testAlarmOrg("THW"); });
+
+    rowBtn("Test: RD Durchsage", function () {
+      if (!FUNK_ENABLED) return;
+      enqueue("TEST_RD_SPEECH", async function () {
+        if (DATA_BEFORE_RD_POL_SPEECH) {
+          await sleep(Math.max(0, DATA_BEFORE_RD_POL_DELAY_MS));
+          await playDataQueued();
+        }
+        await speakQueued("Ulm eins dreiundachtzig eins hat aufgenommen. Fahrt nach Klinik Ehingen Schockraum.", "RD");
+        await sleep(80);
+      });
+    });
+
+    rowBtn("Test: POL Durchsage", function () {
+      if (!FUNK_ENABLED) return;
+      enqueue("TEST_POL_SPEECH", async function () {
+        if (DATA_BEFORE_RD_POL_SPEECH) {
+          await sleep(Math.max(0, DATA_BEFORE_RD_POL_DELAY_MS));
+          await playDataQueued();
+        }
+        await speakQueued("Ulm drei einhundertzehn fährt mit Person zum Polizeirevier Ulm.", "POL");
+        await sleep(80);
+      });
+    });
+
+    rowBtn("Debug: AN/AUS", function () {
+      DEBUG = !DEBUG;
+      title.textContent = DEBUG ? "📻 Funk Testpanel (Debug AN)" : "📻 Funk Testpanel";
+      log("DEBUG =", DEBUG);
+    });
+
+    document.body.appendChild(wrap);
+    return wrap;
+
+    function testAlarmOrg(org) {
+      if (!FUNK_ENABLED) return;
+      enqueue("TEST_ALARM_" + org, async function () {
+        await playDataQueued();
+        await playAlarmOrgQueued(org);
+      });
+    }
+  }
+
+  var testPanel = makePanel();
+
+  makeBtn("🎤 Funk aktivieren", 20, function () {
+    FUNK_ENABLED = true;
+    initAudio();
+
+    Promise.all([
+      loadSample("FMS",  "SND_FMS"),
+      loadSample("DATA", "SND_DATA"),
+      loadSample("FW",   "SND_FW"),
+      loadSample("RD",   "SND_RD"),
+      loadSample("THW",  "SND_THW")
+    ]).then(function () {
+      testPanel.style.display = "block";
+      enqueue("FUNK_ENABLED_SPEECH", async function () {
+        await speakQueued("Funk aktiviert", "FW");
+      });
+    });
+  });
+
+  /* =========================
+     HELPERS
+  ========================= */
+  function normalizeSpaces(s) { return String(s || "").replace(/\s+/g, " ").trim(); }
+  function stripBuilding(s) { return normalizeSpaces(String(s || "").replace(/%building%/ig, "")); }
+
+  function unitForSpeech(unit) {
+    var s = String(unit || "").trim();
+    var prev;
+    do {
+      prev = s;
+      s = s.replace(/(\d)\s*[\/-]\s*(\d)/g, "$1 $2");
+    } while (s !== prev);
+    return s.replace(/\s+/g, " ").trim();
+  }
+
+  function getOrg(fahrzeug) {
+    if (/(^|\s)\d+\/110\b|(^|\s)\d+\/311\b/i.test(fahrzeug)) return "POL";
+    if (/FuStW|Polizei|POL|Kripo|HGrKW|WaWe/i.test(fahrzeug)) return "POL";
+
+    if (/Christoph|RTH|Hubschrauber|HEMS/i.test(fahrzeug)) return "RD";
+    if (/RTW|NEF|KTW|RTH|NAW|ITW|RD|Rettung/i.test(fahrzeug)) return "RD";
+
+    if (/THW|GKW|MTW\s*TZ|FGr|Bergung|OV\s+/i.test(fahrzeug)) return "THW";
+    return "FW";
+  }
+
+  var seen = {};
+  function alreadySeen(key) {
+    if (!key) return false;
+    if (seen[key]) return true;
+    seen[key] = true;
+    setTimeout(function () { delete seen[key]; }, 6000);
+    return false;
+  }
+
+  function findLinkInLine(li, pathPart) {
+    try { return li ? li.querySelector("a[href*='" + pathPart + "']") : null; }
+    catch (e) { return null; }
+  }
+  function extractIdFromHref(a, re) {
+    try {
+      if (!a) return null;
+      var href = a.getAttribute("href") || "";
+      var m = href.match(re);
+      return m ? m[1] : null;
+    } catch (e) { return null; }
+  }
+  function getVehicleIdFromLine(li) {
+    var a = findLinkInLine(li, "/vehicles/");
+    return extractIdFromHref(a, /\/vehicles\/(\d+)/);
+  }
+  function getUnitNameFromLine(li) {
+    try {
+      var a = findLinkInLine(li, "/vehicles/");
+      var t = a ? (a.textContent || "").trim() : "";
+      return t || "Einsatzmittel";
+    } catch (e) { return "Einsatzmittel"; }
+  }
+
+  function missionKeyFromLine(li, text) {
+    try {
+      var a = findLinkInLine(li, "/missions/");
+      var mid = extractIdFromHref(a, /\/missions\/(\d+)/);
+      if (mid) return "M:" + mid;
+
+      var cleaned = normalizeSpaces(text)
+        .toLowerCase()
+        .replace(/^\s*\d+\s+/, "")
+        .replace(/^[^\s]+\s+/, "")
+        .replace(/\bzum einsatz\b.*$/i, "zum einsatz")
+        .replace(/\bauf anfahrt\b.*$/i, "auf anfahrt")
+        .trim();
+
+      if (!cleaned) cleaned = "unknown";
+      return "TXT:" + cleaned.substring(0, 60);
+    } catch (e) {
+      return "FALLBACK:" + Date.now();
+    }
+  }
+
+  /* =========================
+     STATUS EXTRACT + MATCHING
+  ========================= */
+
+  // ✅ Robust: Statusnummer aus Funkzeile extrahieren (Status 3 / "3 ..." / S3)
+  function extractStatusNumber(text) {
+    var t = String(text || "").trim();
+
+    var m1 = t.match(/\bstatus\s*(\d)\b/i);
+    if (m1) return parseInt(m1[1], 10);
+
+    var m2 = t.match(/^\s*(\d)\b/);
+    if (m2) return parseInt(m2[1], 10);
+
+    var m3 = t.match(/\bS(\d)\b/i);
+    if (m3) return parseInt(m3[1], 10);
+
+    return null;
+  }
+
+  function isStatus7(text) {
+    return /status\s*7\b/i.test(text) ||
+           /patient\s+aufgenommen/i.test(text) ||
+           /\b(krankenhaus|kkh|klinik|spital|schockraum|notaufnahme)\b/i.test(text);
+  }
+
+  function isRdTransport(text) {
+    var t = String(text || "");
+    if (/\bhat\s+aufgenommen\b/i.test(t) || /\bpatient\s+aufgenommen\b/i.test(t)) return true;
+    if (/\bfliegt\b.*\bnach\b/i.test(t) && /\b(patient|krankenhaus|klinik|kkh|spital)\b/i.test(t)) return true;
+
+    var transportHint =
+      /\bfährt\b.*\bnach\b/i.test(t) ||
+      /\btransport\s+nach\b/i.test(t) ||
+      /\bbringt\b.*\bnach\b/i.test(t) ||
+      /\bmit\s+patient\b.*\bnach\b/i.test(t);
+
+    if (!transportHint) return false;
+
+    var hasHospitalWord = /\b(krankenhaus|klinik|kkh|spital|schockraum|notaufnahme)\b/i.test(t);
+    var hasNachZiel = /\b(?:fährt|transport|bringt|fliegt).{0,70}\bnach\s+[^,.;:]+/i.test(t);
+    return hasHospitalWord || hasNachZiel;
+  }
+
+  function isPolTransport(text) {
+    var t = String(text || "");
+    if (/\bpolizeirevier\b/i.test(t)) return true;
+    if (/\bzum\s+revi(er|er)\b/i.test(t)) return true;
+    if (/\b(zur|zum)\s+polizei\b/i.test(t)) return true;
+    if (/\bmit\s+person\b.*\b(polizei|polizeirevier|revi(er|er))\b/i.test(t)) return true;
+    if (/\bfährt\b/i.test(t) && /\b(polizei|polizeirevier|revi(er|er))\b/i.test(t)) return true;
+    return false;
+  }
+
+  function prettifyTarget(t) {
+    t = stripBuilding(t);
+    t = t.replace(/\s+/g, " ").trim();
+    t = t.replace(/\bkkh\b/ig, "Krankenhaus");
+    t = t.replace(/\s+$/, "");
+    return t;
+  }
+
+  function extractRdTarget(text) {
+    var t = stripBuilding(text);
+
+    var ms = t.match(/\b(schockraum\s+[^,.;]+)\b/i);
+    if (ms && ms[1]) return prettifyTarget(ms[1]);
+
+    var mz = t.match(/\bziel\s*:\s*([^,.;]+)\b/i);
+    if (mz && mz[1]) return prettifyTarget(mz[1]);
+
+    var m1 = t.match(/\b(?:fährt\b.\bnach|transport\s+nach|fliegt\b.\bnach|bringt\b.\bnach|nach)\s+((?:KKH|Klinik|Krankenhaus|Spital)\s[^,.;]+)\b/i);
+    if (m1 && m1[1]) return prettifyTarget(m1[1]);
+
+    var m2 = t.match(/\b(?:ins|in\s+die|in\s+den)\s+(krankenhaus|klinik)\s*([^,.;]*)\b/i);
+    if (m2) {
+      var suffix = normalizeSpaces(m2[2] || "");
+      return prettifyTarget(m2[1] + (suffix ? " " + suffix : ""));
+    }
+
+    var m3 = t.match(/\bnach\s+([^,.;:]+)\b/i);
+    if (m3 && m3[1]) return prettifyTarget(m3[1]);
+
+    return null;
+  }
+
+  function extractPolTarget(text) {
+    var t = stripBuilding(text);
+
+    var m1 = t.match(/\bpolizeirevier\s+([^,.;]+)\b/i);
+    if (m1 && m1[1]) return "Polizeirevier " + prettifyTarget(m1[1]);
+
+    var m2 = t.match(/\bzum\s+polizeirevier\s+([^,.;]+)\b/i);
+    if (m2 && m2[1]) return "Polizeirevier " + prettifyTarget(m2[1]);
+
+    var m3 = t.match(/\bzum\s+revi(?:er|er)\s+([^,.;]+)\b/i);
+    if (m3 && m3[1]) return "Polizeirevier " + prettifyTarget(m3[1]);
+
+    if (/\bpolizeirevier\b/i.test(t) || /\bzum\s+revi(?:er|er)\b/i.test(t)) return "Polizeirevier";
+
+    var m4 = t.match(/\bnach\s+([^,.;:]+)\b/i);
+    if (m4 && m4[1]) return prettifyTarget(m4[1]);
+
+    return null;
+  }
+
+  /* =========================
+     AUDIO ACTIONS (queued wrappers)
+  ========================= */
+  async function playFMSQueued() {
+    if (!FUNK_ENABLED) return;
+    if (!initAudio()) return;
+
+    var delay = 0;
+    if (ENABLE_SQUELCH) {
+      playSquelch(delay, squelchPreMs, squelchLevel);
+      delay += (squelchPreMs / 1000);
+    }
+    var d = playSample("FMS", delay, volFMS);
+    delay += d;
+    if (ENABLE_SQUELCH) {
+      playSquelch(delay, squelchPostMs, squelchLevel);
+      delay += (squelchPostMs / 1000);
+    }
+    await sleep((delay * 1000) + GAP_AFTER_AUDIO_MS);
+  }
+
+  async function playDataQueued() {
+    if (!FUNK_ENABLED) return;
+    if (!initAudio()) return;
+    var d = playSample("DATA", 0, volData);
+    await sleep((d * 1000) + GAP_AFTER_AUDIO_MS);
+  }
+
+  async function playAlarmOrgQueued(org) {
+    if (!FUNK_ENABLED) return;
+    if (!initAudio()) return;
+
+    var snd = (org === "RD") ? "RD" : (org === "THW") ? "THW" : "FW";
+    var vol = (org === "RD") ? volRD : (org === "THW") ? volTHW : volFW;
+
+    var delay = 0;
+    if (ENABLE_SQUELCH) {
+      playSquelch(delay, squelchPreMs, squelchLevel);
+      delay += (squelchPreMs / 1000);
+    }
+    var d = playSample(snd, delay, vol);
+    delay += d;
+    if (ENABLE_SQUELCH) {
+      playSquelch(delay, squelchPostMs, squelchLevel);
+      delay += (squelchPostMs / 1000);
+    }
+    await sleep((delay * 1000) + GAP_AFTER_AUDIO_MS);
+  }
+
+  /* =========================
+     Sammelalarm pro Einsatz (NUR Status 3!)
+  ========================= */
+  var pending = {};
+  var lastMissionAlarm = {};
+
+  function addAlarmToMission(mKey, org, vehicleId) {
+    if (!pending[mKey]) pending[mKey] = { orgs: {}, vehicles: {}, timer: null };
+    pending[mKey].orgs[org] = true;
+    if (vehicleId) pending[mKey].vehicles[vehicleId] = true;
+
+    if (pending[mKey].timer) return;
+    pending[mKey].timer = setTimeout(function () { fireMissionAlarm(mKey); }, COLLECT_WINDOW_MS);
+  }
+
+  function buildCollectSpeak(orgs, count) {
+    function orgName(o) {
+      if (o === "FW") return "Feuerwehr";
+      if (o === "RD") return "Rettungsdienst";
+      if (o === "THW") return "THW";
+      if (o === "POL") return "Polizei";
+      return o;
+    }
+    function countText(n) { return (!n || n <= 0) ? "" : ", " + n + " Einsatzmittel"; }
+
+    if (orgs.length === 1 && orgs[0] === "POL") return "Polizei rückt aus" + countText(count) + ".";
+    if (orgs.length === 1) return orgName(orgs[0]) + " rückt aus" + countText(count) + ".";
+
+    var names = orgs.filter(function (o) { return o !== "POL"; }).map(orgName);
+    if (!names.length) return "Einheiten rücken aus" + countText(count) + ".";
+
+    if (names.length === 2) return names[0] + " und " + names[1] + " rücken aus" + countText(count) + ".";
+    var last = names.pop();
+    return names.join(", ") + " und " + last + " rücken aus" + countText(count) + ".";
+  }
+
+  function fireMissionAlarm(mKey) {
+    var pack = pending[mKey];
+    if (!pack) return;
+    delete pending[mKey];
+
+    var now = Date.now();
+    if (lastMissionAlarm[mKey] && (now - lastMissionAlarm[mKey] < MISSION_COOLDOWN_MS)) return;
+    lastMissionAlarm[mKey] = now;
+
+    var orgs = Object.keys(pack.orgs || {});
+    if (!orgs.length) return;
+
+    function orgOrder(o) {
+      if (o === "FW") return 1;
+      if (o === "RD") return 2;
+      if (o === "THW") return 3;
+      if (o === "POL") return 4;
+      return 9;
+    }
+    orgs.sort(function (a, b) { return orgOrder(a) - orgOrder(b); });
+
+    var count = Object.keys(pack.vehicles || {}).length || 0;
+    var speakText = buildCollectSpeak(orgs, count);
+    var voiceOrg = orgs.indexOf("RD") !== -1 ? "RD" : (orgs.indexOf("THW") !== -1 ? "THW" : "FW");
+
+    enqueue("ALARM_" + mKey, async function () {
+      await playDataQueued();
+      for (var i = 0; i < orgs.length; i++) {
+        var o = orgs[i];
+        if (o === "POL") continue;
+        await playAlarmOrgQueued(o);
+      }
+      await speakQueued(speakText, voiceOrg);
+      await sleep(80);
+    });
+  }
+
+  /* =========================
+     MAIN: RADIO OBSERVER
+  ========================= */
+  var lastRdSpeakByVehicle = {};
+  var lastPolSpeakByVehicle = {};
+  var observerStarted = false;
+
+  function processLine(li) {
+    if (!li || !li.querySelector) return;
+
+    var vehicleLink = findLinkInLine(li, "/vehicles/");
+    if (!vehicleLink) return;
+
+    var fahrzeugRaw = (vehicleLink.textContent || "").trim();
+    if (!fahrzeugRaw) return;
+
+    var org = getOrg(fahrzeugRaw);
+    var text = normalizeSpaces(li.textContent || "");
+    if (!text) return;
+
+    var dkey = fahrzeugRaw + "::" + text;
+    if (alreadySeen(dkey)) return;
+
+    var st = extractStatusNumber(text);
+    log("Funk:", org, "st=", st, text);
+
+    // ✅ FMS nur bei echten Status 1/2/3/4/7/8
+    if (FUNK_ENABLED && (st === 1 || st === 2 || st === 3 || st === 4 || st === 8 || st === 7 || isStatus7(text))) {
+      enqueue("FMS_" + dkey.slice(0, 40), async function () {
+        await playFMSQueued();
+      });
+    }
+
+    // RD Durchsage
+    if (org === "RD" && isRdTransport(text)) {
+      if (!FUNK_ENABLED) return;
+      var vid = getVehicleIdFromLine(li) || ("NAME:" + fahrzeugRaw);
+      var now = Date.now();
+      if (lastRdSpeakByVehicle[vid] && (now - lastRdSpeakByVehicle[vid] < RD_SPEAK_COOLDOWN_MS)) return;
+      lastRdSpeakByVehicle[vid] = now;
+
+      var unit = unitForSpeech(getUnitNameFromLine(li));
+      var ziel = extractRdTarget(text) || "Krankenhaus";
+      var sonder = /sonderrechte/i.test(text);
+
+      var say;
+      if (/\bfliegt\b/i.test(text)) {
+        say = unit + " fliegt mit Patient nach " + ziel + ".";
+      } else if (/\bhat\s+aufgenommen\b/i.test(text) || /\bpatient\s+aufgenommen\b/i.test(text)) {
+        say = unit + " hat aufgenommen." + (sonder ? " Mit Sonderrechten" : "") + " Fahrt nach " + ziel + ".";
+      } else {
+        say = unit + (sonder ? " mit Sonderrechten" : "") + " fährt nach " + ziel + ".";
+      }
+
+      enqueue("RD_SPEECH_" + vid, async function () {
+        if (DATA_BEFORE_RD_POL_SPEECH) {
+          await sleep(Math.max(0, DATA_BEFORE_RD_POL_DELAY_MS));
+          await playDataQueued();
+        }
+        await speakQueued(say, "RD");
+        await sleep(80);
+      });
+    }
+
+    // POL Durchsage
+    if (org === "POL" && isPolTransport(text)) {
+      if (!FUNK_ENABLED) return;
+      var vidp = getVehicleIdFromLine(li) || ("NAME:" + fahrzeugRaw);
+      var nowp = Date.now();
+      if (lastPolSpeakByVehicle[vidp] && (nowp - lastPolSpeakByVehicle[vidp] < POL_SPEAK_COOLDOWN_MS)) return;
+      lastPolSpeakByVehicle[vidp] = nowp;
+
+      var unitp = unitForSpeech(getUnitNameFromLine(li));
+      var zielp = extractPolTarget(text) || "Polizeirevier";
+      var sonderp = /sonderrechte/i.test(text);
+
+      var sayp;
+      if (/\bmit\s+person\b/i.test(text)) {
+        sayp = unitp + " fährt mit Person zum " + zielp + ".";
+      } else {
+        sayp = unitp + (sonderp ? " fährt mit Sonderrechten zum " : " fährt zum ") + zielp + ".";
+      }
+
+      enqueue("POL_SPEECH_" + vidp, async function () {
+        if (DATA_BEFORE_RD_POL_SPEECH) {
+          await sleep(Math.max(0, DATA_BEFORE_RD_POL_DELAY_MS));
+          await playDataQueued();
+        }
+        await speakQueued(sayp, "POL");
+        await sleep(80);
+      });
+    }
+
+    // ✅ ALARM NUR wenn echte Statusnummer == 3
+    if (st === 3) {
+      var vid2 = getVehicleIdFromLine(li);
+      var mKey = missionKeyFromLine(li, text);
+      addAlarmToMission(mKey, org, vid2);
+      return;
+    }
+  }
+
+  function startObserver(target, label) {
+    if (observerStarted) return;
+    observerStarted = true;
+
+    var obs = new MutationObserver(function (mutations) {
+      mutations.forEach(function (m) {
+        if (m.addedNodes && m.addedNodes.length) {
+          for (var i = 0; i < m.addedNodes.length; i++) {
+            var node = m.addedNodes[i];
+            if (!(node instanceof HTMLElement)) continue;
+
+            var li = (node.matches && node.matches("li")) ? node : (node.closest ? node.closest("li") : null);
+            if (li) processLine(li);
+
+            if (node.querySelectorAll) {
+              var lis = node.querySelectorAll("li");
+              if (lis && lis.length) for (var j = 0; j < lis.length; j++) processLine(lis[j]);
+            }
+          }
+        }
+
+        if (m.type === "characterData" || m.type === "attributes") {
+          var el = (m.target && m.target.nodeType === 3) ? m.target.parentElement : m.target;
+          var li2 = el && el.closest ? el.closest("li") : null;
+          if (li2) processLine(li2);
+        }
+      });
+    });
+
+    obs.observe(target, { childList: true, subtree: true, characterData: true, attributes: true });
+    console.log("Observer aktiv auf:", label);
+  }
+
+  function findRadioTarget() {
+    var rm = document.getElementById("radio_messages");
+    if (rm) return { el: rm, label: "#radio_messages" };
+
+    var cand =
+      document.querySelector("#radio") ||
+      document.querySelector(".radio_messages") ||
+      document.querySelector(".radio") ||
+      document.querySelector("[id*='radio']") ||
+      document.querySelector("[class*='radio']");
+
+    if (cand) return { el: cand, label: "radio-candidate" };
+    return { el: document.body, label: "document.body" };
+  }
+
+  var t = findRadioTarget();
+  startObserver(t.el, t.label);
+
+})();
